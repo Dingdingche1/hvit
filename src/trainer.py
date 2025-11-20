@@ -33,7 +33,8 @@ class LiTHViT(LightningModule):
         self.loss_weights = {
             "mse": self.args.mse_weights,
             "dice": self.args.dice_weights,
-            "grad": self.args.grad_weights
+            "grad": self.args.grad_weights,
+            "ddpm": getattr(self.args, "ddpm_weights", 1.0)
         }
         self.wandb_logger = wandb_logger
         self.test_step_outputs = []
@@ -53,7 +54,7 @@ class LiTHViT(LightningModule):
                 source, target = batch[0].to(dtype=dtype_), batch[1].to(dtype=dtype_)
                 src_seg, tgt_seg = batch[2], batch[3]
                 
-            moved, flow = self.hvit(source, target)
+            moved, flow, ddpm_loss = self.hvit(source, target)
 
             if calc_score:
                 moved_seg = self._get_one_hot_from_src(src_seg, flow, self.args.num_labels)
@@ -68,7 +69,9 @@ class LiTHViT(LightningModule):
                     _loss[key] = weight * loss_functions[key](moved_seg, tgt_seg.long())
                 elif key == "grad":
                     _loss[key] = weight * loss_functions[key](flow)
-            
+                elif key == "ddpm" and ddpm_loss is not None:
+                    _loss[key] = weight * ddpm_loss
+
             _loss["avg_loss"] = sum(_loss.values()) / len(_loss)
         return _loss, _score
 

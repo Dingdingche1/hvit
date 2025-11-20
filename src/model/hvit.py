@@ -23,6 +23,7 @@ from einops import rearrange
 import lightning as L
 
 from src.model.blocks import *
+from src.model.diffusion import DiffusionRegistration
 from src.model.transformation import *
 
 
@@ -798,7 +799,18 @@ class HViT(nn.Module):
             kernel_size=ndims,
         )
 
-    def forward(self, source: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
+        diffusion_config = config.get('diffusion', {})
+        cond_channels = diffusion_config.get('cond_channels', config.get('in_channels', 1) * 2 + config.get('fpn_channels', 64))
+        self.diffusion = DiffusionRegistration(
+            num_steps=diffusion_config.get('num_steps', 1000),
+            beta_start=diffusion_config.get('beta_start', 1e-4),
+            beta_end=diffusion_config.get('beta_end', 0.02),
+            cond_channels=cond_channels,
+            base_channels=diffusion_config.get('base_channels', config.get('fpn_channels', 64)),
+            flow_channels=ndims,
+        )
+
+    def forward(self, source: Tensor, target: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass of the HViT model.
 
@@ -807,7 +819,7 @@ class HViT(nn.Module):
             target (Tensor): Target image tensor.
 
         Returns:
-            Tuple[Tensor, Tensor]: Moved image and displacement field.
+            Tuple[Tensor, Tensor, Tensor]: Moved image, displacement field, and DDPM noise-prediction loss.
         """
         x: Tensor = torch.cat((source, target), dim=1)
         x_dec: Dict[str, Tensor] = self.deformable(x)
@@ -817,12 +829,13 @@ class HViT(nn.Module):
         flow: Tensor = self.reg_head(x_dec)
 
         if self.upsample_df:
-            flow = nn.Upsample(scale_factor=self.upsample_scale_factor, 
-                               mode='trilinear', 
+            flow = nn.Upsample(scale_factor=self.upsample_scale_factor,
+                               mode='trilinear',
                                align_corners=False)(flow)
-        
+
+        flow, ddpm_loss = self.diffusion(flow, source=source, target=target, feature=x_dec)
         moved: Tensor = self.spatial_trans(source, flow)
-        return moved, flow
+        return moved, flow, ddpm_loss
 
 
 if __name__ == "__main__":
@@ -875,8 +888,8 @@ if __name__ == "__main__":
             source = source.to(dtype=torch.float16).to(device)
             tgt = tgt.to(dtype=torch.float16).to(device)
 
-            moved, flow = model(source, tgt)
-            print('\n\nmoved {} flow {}'.format(moved.shape, flow.shape))
+            moved, flow, ddpm_loss = model(source, tgt)
+            print('\n\nmoved {} flow {} ddpm {}'.format(moved.shape, flow.shape, ddpm_loss.item()))
 
             max_mem_mb = torch.cuda.max_memory_allocated() / 1024**3
             print("[+] Maximum memory:\t{:.2f}GB: >>> \t{:.0f} feats".format(max_mem_mb, config['fpn_channels']) if max_mem_mb is not None else "")

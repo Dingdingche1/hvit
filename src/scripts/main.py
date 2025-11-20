@@ -31,6 +31,7 @@ def parse_arguments():
     parser.add_argument("--mse_weights",type=float, default=1, help="MSE Loss weights")
     parser.add_argument("--dice_weights", type=float, default=1, help="Dice Loss weights")
     parser.add_argument("--grad_weights", type=float, default=0.02, help="Grad Loss weights")
+    parser.add_argument("--ddpm_weights", type=float, default=1.0, help="DDPM noise prediction loss weight")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--tgt2src_reg", type=bool, default=True, help="target to source registration during training")
