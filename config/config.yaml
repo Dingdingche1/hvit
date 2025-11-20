@@ -30,3 +30,8 @@ attn_drop_rate: 0.0
 use_seg_loss: false
 use_seg_proxy_loss: false
 num_organs: -1
+diffusion:
+  num_steps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  base_channels: 128

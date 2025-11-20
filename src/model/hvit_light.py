@@ -895,8 +895,8 @@ if __name__ == "__main__":
             source = source.to(dtype=torch.float16).to(device)
             tgt = tgt.to(dtype=torch.float16).to(device)
 
-            moved, flow = model(source, tgt)
-            print('\n\nmoved {} flow {}'.format(moved.shape, flow.shape))
+            moved, flow, ddpm_loss = model(source, tgt)
+            print('\n\nmoved {} flow {} ddpm {}'.format(moved.shape, flow.shape, ddpm_loss.item()))
 
             max_mem_mb = torch.cuda.max_memory_allocated() / 1024**3
             print("[+] Maximum memory:\t{:.2f}GB: >>> \t{:.0f} feats".format(max_mem_mb, config['fpn_channels']) if max_mem_mb is not None else "")
