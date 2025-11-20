@@ -24,6 +24,7 @@ import lightning as L
 
 from src.model.blocks import *
 from src.model.transformation import *
+from src.model.diffuse_morph import DiffuseMorphField
 
 
 WO_SELF_ATT = False # without self attention
@@ -788,15 +789,29 @@ class HViT_Light(nn.Module):
         self.upsample_df: bool = config.get('upsample_df', False)
         self.upsample_scale_factor: int = config.get('upsample_scale_factor', 2)
         self.scale_level_df: str = config.get('scale_level_df', 'P1')
+        self.use_diffuse_morph: bool = config.get('use_diffuse_morph', True)
 
         self.deformable: HierarchicalViT = HierarchicalViT(config)
         self.avg_pool: nn.AvgPool3d = nn.AvgPool3d(3, stride=2, padding=1)
         self.spatial_trans: SpatialTransformer = SpatialTransformer(config['data_size'])
-        self.reg_head: RegistrationHead = RegistrationHead(
-            in_channels=config.get('fpn_channels', 64),
-            out_channels=ndims,
-            kernel_size=ndims,
-        )
+        if self.use_diffuse_morph:
+            self.morph_head: DiffuseMorphField = DiffuseMorphField(
+                base_channels=config.get('fpn_channels', 64),
+                pyramid_levels=config.get('out_fmaps', ['P4', 'P3', 'P2', 'P1']),
+                target_size=config.get('data_size', [160, 192, 224]),
+                upsample_mode=config.get('diffuse_morph_upsample_mode', 'trilinear'),
+                use_svf=config.get('use_svf', False),
+                integration_steps=config.get('svf_integration_steps', 5),
+                smoothness_weight=config.get('smoothness_weight', 0.0),
+                bending_weight=config.get('bending_weight', 0.0),
+            )
+        else:
+            self.reg_head: RegistrationHead = RegistrationHead(
+                in_channels=config.get('fpn_channels', 64),
+                out_channels=ndims,
+                kernel_size=ndims,
+            )
+        self.regularization_terms: Dict[str, Tensor] = {}
 
     def forward(self, source: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -812,15 +827,20 @@ class HViT_Light(nn.Module):
         x: Tensor = torch.cat((source, target), dim=1)
         x_dec: Dict[str, Tensor] = self.deformable(x)
 
-        # Extract features at the specified scale level
-        x_dec: Tensor = x_dec[self.scale_level_df]
-        flow: Tensor = self.reg_head(x_dec)
+        if self.use_diffuse_morph:
+            pyramid_features: Dict[str, Tensor] = {k: v for k, v in x_dec.items() if k.startswith('P')}
+            flow, self.regularization_terms = self.morph_head(pyramid_features)
+        else:
+            # Extract features at the specified scale level
+            x_dec_lvl: Tensor = x_dec[self.scale_level_df]
+            flow = self.reg_head(x_dec_lvl)
 
-        if self.upsample_df:
-            flow = nn.Upsample(scale_factor=self.upsample_scale_factor, 
-                               mode='trilinear', 
-                               align_corners=False)(flow)
-        
+            if self.upsample_df:
+                flow = nn.Upsample(scale_factor=self.upsample_scale_factor,
+                                   mode='trilinear',
+                                   align_corners=False)(flow)
+            self.regularization_terms = {}
+
         moved: Tensor = self.spatial_trans(source, flow)
         return moved, flow
 
