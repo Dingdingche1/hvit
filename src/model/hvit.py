@@ -598,6 +598,7 @@ class Decoder(nn.Module):
 
         # Multi-scale attention
         self.hierarchical_dec: nn.ModuleList = self._create_hierarchical_layers(config, out_out_channels)
+        self.cross_conditioners: nn.ModuleList = self._create_cross_conditioners(config, out_out_channels)
 
         if self.use_seg:
             self._seg_head: nn.ModuleList = nn.ModuleList([
@@ -644,6 +645,29 @@ class Decoder(nn.Module):
                 )
         return out
 
+    def _create_cross_conditioners(self, config: Dict[str, Any], out_out_channels: List[int]) -> nn.ModuleList:
+        """Create cross-conditioned Mamba bridges between decoder stages."""
+
+        bidirectional: bool = config.get('cross_conditioning_bidirectional', False)
+        reduction: int = config.get('cross_conditioning_reduction', 4)
+        dropout: float = config.get('cross_conditioning_dropout', 0.0)
+
+        conditioners: nn.ModuleList = nn.ModuleList()
+        for idx, out_ch in enumerate(out_out_channels):
+            if idx == 0:
+                conditioners.append(nn.Identity())
+            else:
+                conditioners.append(
+                    CrossConditionedMambaBridge(
+                        low_dim=out_ch,
+                        high_dim=out_out_channels[idx - 1],
+                        reduction=reduction,
+                        dropout=dropout,
+                        bidirectional=bidirectional,
+                    )
+                )
+        return conditioners
+
     def forward(self, x: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Forward pass of the Decoder."""
         lateral_out: List[Tensor] = [lateral(fmap) for lateral, fmap in zip(self._lateral, list(x.values())[-self._lateral_levels:])]
@@ -667,12 +691,22 @@ class Decoder(nn.Module):
 
         out_dict: Dict[str, Tensor] = {}
         QK: List[Tensor] = []
+        prev_context: Optional[Tensor] = None
         for i, key in enumerate(range(max(cnn_outputs.keys()), min(cnn_outputs.keys())-1, -1)):
+            conditioner = self.cross_conditioners[i]
+            if isinstance(conditioner, CrossConditionedMambaBridge):
+                xs[i], prev_context = conditioner(xs[i], prev_context)
+                if prev_context is not None and len(QK) > 0:
+                    QK[0] = prev_context
+            else:
+                xs[i] = conditioner(xs[i])
+
             QK = [xs[i]] + QK
             if i == 0:
                 Pi = QK[0]
             else:
                 Pi = self.hierarchical_dec[i](QK)
+            prev_context = Pi
             QK[0] = Pi
             out_dict[f'P{key}'] = Pi
 
