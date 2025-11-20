@@ -25,6 +25,7 @@ import lightning as L
 from src.model.blocks import *
 from src.model.diffusion import DiffusionRegistration
 from src.model.transformation import *
+from src.model.diffuse_morph import DiffuseMorphField
 
 
 WO_SELF_ATT = False # without self attention
@@ -599,6 +600,7 @@ class Decoder(nn.Module):
 
         # Multi-scale attention
         self.hierarchical_dec: nn.ModuleList = self._create_hierarchical_layers(config, out_out_channels)
+        self.cross_conditioners: nn.ModuleList = self._create_cross_conditioners(config, out_out_channels)
 
         if self.use_seg:
             self._seg_head: nn.ModuleList = nn.ModuleList([
@@ -645,6 +647,29 @@ class Decoder(nn.Module):
                 )
         return out
 
+    def _create_cross_conditioners(self, config: Dict[str, Any], out_out_channels: List[int]) -> nn.ModuleList:
+        """Create cross-conditioned Mamba bridges between decoder stages."""
+
+        bidirectional: bool = config.get('cross_conditioning_bidirectional', False)
+        reduction: int = config.get('cross_conditioning_reduction', 4)
+        dropout: float = config.get('cross_conditioning_dropout', 0.0)
+
+        conditioners: nn.ModuleList = nn.ModuleList()
+        for idx, out_ch in enumerate(out_out_channels):
+            if idx == 0:
+                conditioners.append(nn.Identity())
+            else:
+                conditioners.append(
+                    CrossConditionedMambaBridge(
+                        low_dim=out_ch,
+                        high_dim=out_out_channels[idx - 1],
+                        reduction=reduction,
+                        dropout=dropout,
+                        bidirectional=bidirectional,
+                    )
+                )
+        return conditioners
+
     def forward(self, x: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Forward pass of the Decoder."""
         lateral_out: List[Tensor] = [lateral(fmap) for lateral, fmap in zip(self._lateral, list(x.values())[-self._lateral_levels:])]
@@ -668,12 +693,22 @@ class Decoder(nn.Module):
 
         out_dict: Dict[str, Tensor] = {}
         QK: List[Tensor] = []
+        prev_context: Optional[Tensor] = None
         for i, key in enumerate(range(max(cnn_outputs.keys()), min(cnn_outputs.keys())-1, -1)):
+            conditioner = self.cross_conditioners[i]
+            if isinstance(conditioner, CrossConditionedMambaBridge):
+                xs[i], prev_context = conditioner(xs[i], prev_context)
+                if prev_context is not None and len(QK) > 0:
+                    QK[0] = prev_context
+            else:
+                xs[i] = conditioner(xs[i])
+
             QK = [xs[i]] + QK
             if i == 0:
                 Pi = QK[0]
             else:
                 Pi = self.hierarchical_dec[i](QK)
+            prev_context = Pi
             QK[0] = Pi
             out_dict[f'P{key}'] = Pi
 
@@ -789,15 +824,29 @@ class HViT(nn.Module):
         self.upsample_df: bool = config.get('upsample_df', False)
         self.upsample_scale_factor: int = config.get('upsample_scale_factor', 2)
         self.scale_level_df: str = config.get('scale_level_df', 'P1')
+        self.use_diffuse_morph: bool = config.get('use_diffuse_morph', True)
 
         self.deformable: HierarchicalViT = HierarchicalViT(config)
         self.avg_pool: nn.AvgPool3d = nn.AvgPool3d(3, stride=2, padding=1)
         self.spatial_trans: SpatialTransformer = SpatialTransformer(config['data_size'])
-        self.reg_head: RegistrationHead = RegistrationHead(
-            in_channels=config.get('fpn_channels', 64),
-            out_channels=ndims,
-            kernel_size=ndims,
-        )
+        if self.use_diffuse_morph:
+            self.morph_head: DiffuseMorphField = DiffuseMorphField(
+                base_channels=config.get('fpn_channels', 64),
+                pyramid_levels=config.get('out_fmaps', ['P4', 'P3', 'P2', 'P1']),
+                target_size=config.get('data_size', [160, 192, 224]),
+                upsample_mode=config.get('diffuse_morph_upsample_mode', 'trilinear'),
+                use_svf=config.get('use_svf', False),
+                integration_steps=config.get('svf_integration_steps', 5),
+                smoothness_weight=config.get('smoothness_weight', 0.0),
+                bending_weight=config.get('bending_weight', 0.0),
+            )
+        else:
+            self.reg_head: RegistrationHead = RegistrationHead(
+                in_channels=config.get('fpn_channels', 64),
+                out_channels=ndims,
+                kernel_size=ndims,
+            )
+        self.regularization_terms: Dict[str, Tensor] = {}
 
         diffusion_config = config.get('diffusion', {})
         cond_channels = diffusion_config.get('cond_channels', config.get('in_channels', 1) * 2 + config.get('fpn_channels', 64))
@@ -824,9 +873,19 @@ class HViT(nn.Module):
         x: Tensor = torch.cat((source, target), dim=1)
         x_dec: Dict[str, Tensor] = self.deformable(x)
 
-        # Extract features at the specified scale level
-        x_dec: Tensor = x_dec[self.scale_level_df]
-        flow: Tensor = self.reg_head(x_dec)
+        if self.use_diffuse_morph:
+            pyramid_features: Dict[str, Tensor] = {k: v for k, v in x_dec.items() if k.startswith('P')}
+            flow, self.regularization_terms = self.morph_head(pyramid_features)
+        else:
+            # Extract features at the specified scale level
+            x_dec_lvl: Tensor = x_dec[self.scale_level_df]
+            flow = self.reg_head(x_dec_lvl)
+
+            if self.upsample_df:
+                flow = nn.Upsample(scale_factor=self.upsample_scale_factor,
+                                   mode='trilinear',
+                                   align_corners=False)(flow)
+            self.regularization_terms = {}
 
         if self.upsample_df:
             flow = nn.Upsample(scale_factor=self.upsample_scale_factor,

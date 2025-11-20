@@ -1,0 +1,53 @@
+experiment: diffusion_registration
+
+# Dataset and dataloader configuration
+data:
+  train_path: /path/to/train
+  val_path: /path/to/val
+  input_dim: [40, 48, 56]
+  batch_size: 2
+  num_workers: 4
+  paired_validation: true
+
+# Noise schedule for DDPM
+noise:
+  timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+# Model setup
+model:
+  hvit_light: true
+  in_channels: 1
+  num_labels: 36
+  ddpm_base_channels: 32
+  ddpm_time_dim: 128
+  use_mamba: true
+  mamba_channels: 32
+
+# Loss configuration
+loss:
+  registration: ncc  # options: ncc or dice
+  weights:
+    ddpm: 1.0
+    reg: 1.0
+    grad: 0.02
+
+# Optimisation and precision strategy
+optimization:
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_accumulation: 2
+  ddpm_precision: bf16
+  mamba_precision: bf16
+  trainer_precision: 32-true
+  grad_clip: 1.0
+
+training:
+  max_epochs: 200
+  devices: 1
+  log_every_n_steps: 10
+
+metrics:
+  - dice
+  - ncc
