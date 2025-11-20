@@ -7,6 +7,40 @@ import math
 import torch.nn as nn
 
 
+class NCCLoss(nn.Module):
+    """Local normalized cross-correlation loss for 3D volumes."""
+
+    def __init__(self, window_size: int = 9, eps: float = 1e-5):
+        super().__init__()
+        self.window_size = window_size
+        self.eps = eps
+
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        if y_true.dim() != 5:
+            raise ValueError("NCCLoss currently supports 3D volumes with shape (B, C, H, W, D)")
+
+        padding = self.window_size // 2
+        window_volume = float(self.window_size ** 3)
+        channels = y_true.shape[1]
+
+        kernel = torch.ones((channels, 1, self.window_size, self.window_size, self.window_size),
+                            device=y_true.device, dtype=y_true.dtype)
+
+        y_true_mean = F.conv3d(y_true, kernel, padding=padding, groups=channels) / (window_volume + self.eps)
+        y_pred_mean = F.conv3d(y_pred, kernel, padding=padding, groups=channels) / (window_volume + self.eps)
+
+        y_true_var = F.conv3d((y_true - y_true_mean) ** 2, kernel, padding=padding, groups=channels)
+        y_pred_var = F.conv3d((y_pred - y_pred_mean) ** 2, kernel, padding=padding, groups=channels)
+
+        cross = F.conv3d((y_true - y_true_mean) * (y_pred - y_pred_mean),
+                         kernel,
+                         padding=padding,
+                         groups=channels)
+
+        cc = cross / torch.sqrt((y_true_var + self.eps) * (y_pred_var + self.eps))
+        return -torch.mean(cc)
+
+
 class Grad3D(torch.nn.Module):
     """
     N-D gradient loss.
@@ -70,4 +104,43 @@ loss_functions = {
     "dice": DiceLoss(),
     "grad": Grad3D(penalty='l2')
 }
+
+
+class CombinedLoss(nn.Module):
+    """Joint loss for diffusion-based registration."""
+
+    def __init__(self, reg_loss: str = "ncc", weights=None, num_classes: int = 36):
+        super().__init__()
+        weights = weights or {"ddpm": 1.0, "reg": 1.0, "grad": 0.02}
+        self.weights = weights
+        self.num_classes = num_classes
+        self.ddpm_loss = nn.MSELoss()
+        self.reg_loss_type = reg_loss
+        self.dice_loss = DiceLoss(num_class=num_classes)
+        self.ncc_loss = NCCLoss()
+        self.grad_loss = Grad3D(penalty='l2')
+
+    def forward(self, predicted_noise: torch.Tensor, target_noise: torch.Tensor,
+                moved: torch.Tensor, target: torch.Tensor,
+                moved_seg: torch.Tensor, target_seg: torch.Tensor,
+                flow: torch.Tensor):
+        ddpm = self.ddpm_loss(predicted_noise, target_noise)
+        if self.reg_loss_type == "dice":
+            reg = self.dice_loss(moved_seg, target_seg.long())
+            reg_name = "dice"
+        else:
+            reg = self.ncc_loss(moved, target)
+            reg_name = "ncc"
+        smooth = self.grad_loss(flow)
+
+        total = self.weights.get("ddpm", 1.0) * ddpm
+        total = total + self.weights.get("reg", 1.0) * reg
+        total = total + self.weights.get("grad", 0.02) * smooth
+
+        return {
+            "ddpm": ddpm,
+            reg_name: reg,
+            "grad": smooth,
+            "total": total
+        }
 
