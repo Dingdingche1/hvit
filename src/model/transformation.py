@@ -11,14 +11,15 @@ class SpatialTransformer(nn.Module):
     N-D Spatial Transformer
     Obtained from https://github.com/voxelmorph/voxelmorph
     """
-    def __init__(self, size, mode='bilinear'):
+    def __init__(self, size, mode: str = 'bilinear', padding_mode: str = 'border'):
         super().__init__()
 
         self.mode = mode
+        self.padding_mode = padding_mode
 
         # create sampling grid
         vectors = [torch.arange(0, s) for s in size]
-        grids = torch.meshgrid(vectors)
+        grids = torch.meshgrid(*vectors, indexing='ij')
         grid = torch.stack(grids)
         grid = torch.unsqueeze(grid, 0)
         grid = grid.type(torch.FloatTensor)
@@ -32,7 +33,7 @@ class SpatialTransformer(nn.Module):
 
     def forward(self, src, flow):
         # new locations
-        new_locs = self.grid + flow
+        new_locs = self.grid.type_as(flow) + flow
         shape = flow.shape[2:]
 
         # need to normalize grid values to [-1, 1] for resampler
@@ -44,11 +45,21 @@ class SpatialTransformer(nn.Module):
         if len(shape) == 2:
             new_locs = new_locs.permute(0, 2, 3, 1)
             new_locs = new_locs[..., [1, 0]]
+            sampling_mode = self.mode
         elif len(shape) == 3:
             new_locs = new_locs.permute(0, 2, 3, 4, 1)
             new_locs = new_locs[..., [2, 1, 0]]
+            sampling_mode = 'trilinear' if self.mode in {'bilinear', 'trilinear'} else self.mode
+        else:
+            sampling_mode = self.mode
 
-        return F.grid_sample(src, new_locs, align_corners=False, mode=self.mode)
+        return F.grid_sample(
+            src,
+            new_locs,
+            align_corners=False,
+            mode=sampling_mode,
+            padding_mode=self.padding_mode,
+        )
 
 
 def normalize_displacement(displacement: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
