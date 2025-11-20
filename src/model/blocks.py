@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from torch import Tensor
 from einops import rearrange
 from functools import reduce
+from typing import Callable, Optional, Tuple
 
 ndims = 3 # H,W,D
 
@@ -282,6 +283,140 @@ class MLP(nn.Module):
     def forward(self, x)-> torch.Tensor:
         x = self.net(x)
         return x
+
+
+class FiLMParameterGenerator(nn.Module):
+    """
+    Generate FiLM parameters (gamma, beta) from a conditioning feature map.
+
+    The generator pools the conditioning tensor to a channel descriptor and
+    predicts per-channel scale and shift values that are softly bounded for
+    numerical stability.
+    """
+
+    def __init__(self, cond_dim: int, target_dim: int, reduction: int = 4):
+        super().__init__()
+        hidden_dim = max(cond_dim // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.proj = nn.Sequential(
+            nn.Conv3d(cond_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(hidden_dim, target_dim * 2, kernel_size=1),
+        )
+
+    def forward(self, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.pool(cond)
+        params = self.proj(x).view(cond.size(0), 2, -1)
+        gamma = torch.tanh(params[:, 0]) * 0.5 + 1.0
+        beta = torch.tanh(params[:, 1]) * 0.5
+        return gamma, beta
+
+
+class SimpleMambaBlock(nn.Module):
+    """
+    Lightweight Mamba-inspired block for volumetric features.
+
+    The block keeps the state-space intuition (depthwise convolutional mixing
+    plus input/output projections) while remaining framework-agnostic. A FiLM
+    tuple ``(gamma, beta)`` can be provided to modulate the normalized tokens
+    for cross-conditioning.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        state_expand: int = 2,
+        d_conv: int = 3,
+        dropout: float = 0.0,
+        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
+    ):
+        super().__init__()
+        self.dim = dim
+        inner_dim = dim * state_expand
+        self.norm = norm_layer(dim)
+        self.in_proj = nn.Linear(dim, inner_dim * 2)
+        self.conv = nn.Conv1d(
+            inner_dim,
+            inner_dim,
+            kernel_size=d_conv,
+            padding=d_conv // 2,
+            groups=inner_dim,
+        )
+        self.out_proj = nn.Linear(inner_dim, dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self, x: torch.Tensor, film: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        b, c, h, w, d = x.shape
+        seq = rearrange(x, "b c h w d -> b (h w d) c")
+        seq_norm = self.norm(seq)
+
+        if film is not None:
+            gamma, beta = film
+            seq_norm = seq_norm * gamma.unsqueeze(1) + beta.unsqueeze(1)
+
+        x_proj, gate = self.in_proj(seq_norm).chunk(2, dim=-1)
+        x_proj = rearrange(x_proj, "b n c -> b c n")
+        x_proj = self.conv(x_proj)
+        x_proj = rearrange(x_proj, "b c n -> b n c")
+        gated = self.act(x_proj) * torch.sigmoid(gate)
+        out = self.out_proj(gated)
+        out = self.dropout(out)
+        out = out + seq
+        out = rearrange(out, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
+        return out
+
+
+class CrossConditionedMambaBridge(nn.Module):
+    """
+    Cross-layer FiLM modulation for a low-level Mamba block.
+
+    High-level features generate FiLM parameters that modulate a low-level
+    Mamba block, and an optional bidirectional path can push low-level context
+    back to the high-level stream. Resampled high-level context is injected
+    after the Mamba update to retain deformation cues across scales.
+    """
+
+    def __init__(
+        self,
+        low_dim: int,
+        high_dim: int,
+        reduction: int = 4,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+    ):
+        super().__init__()
+        self.bidirectional = bidirectional
+        self.film = FiLMParameterGenerator(high_dim, low_dim, reduction=reduction)
+        self.mamba = SimpleMambaBlock(low_dim, dropout=dropout)
+        self.high_adapter = nn.Conv3d(high_dim, low_dim, kernel_size=1)
+        if self.bidirectional:
+            self.low_to_high = nn.Conv3d(low_dim, high_dim, kernel_size=1)
+
+    def forward(
+        self, low_feat: torch.Tensor, high_feat: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        film: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        high_resampled: Optional[torch.Tensor] = None
+
+        if high_feat is not None:
+            film = self.film(high_feat)
+            high_resampled = F.interpolate(
+                high_feat, size=low_feat.shape[2:], mode="trilinear", align_corners=False
+            )
+
+        out = self.mamba(low_feat, film)
+        if high_resampled is not None:
+            out = out + self.high_adapter(high_resampled)
+
+        updated_high = high_feat
+        if self.bidirectional and high_feat is not None:
+            pooled_low = F.adaptive_avg_pool3d(out, high_feat.shape[2:])
+            updated_high = high_feat + self.low_to_high(pooled_low)
+
+        return out, updated_high
 
 
 
